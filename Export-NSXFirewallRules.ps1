@@ -3,551 +3,459 @@
     Exports NSX-T 4.x Distributed Firewall (DFW) and Gateway Firewall (GFW) rules to Excel/CSV.
 
 .DESCRIPTION
-    Connects to an NSX-T Manager via REST API (Policy API v1) and retrieves:
-      - All Distributed Firewall security policies and rules (all categories)
-      - All Gateway Firewall policies and rules for every Tier-0 and Tier-1 gateway
-    Output is saved as a multi-sheet .xlsx file (requires ImportExcel module) and/or CSV files.
+    Connects to NSX-T Manager via the Policy REST API and exports:
+      - All DFW security policies + rules (all categories)
+      - All GFW policies + rules for every Tier-0 and Tier-1 gateway
+
+    Authentication uses session cookies (POST /api/session/create) — required for NSX-T 4.x.
+    Automatic cursor-based pagination handles environments with large rule counts.
 
 .PARAMETER NSXManager
-    FQDN or IP address of the NSX-T Manager (e.g. "nsxmgr.lab.local" or "192.168.1.10")
+    FQDN or IP of the NSX-T Manager  (e.g. "192.168.1.10" or "nsxmgr.lab.local")
 
 .PARAMETER Username
-    NSX-T Manager username (default: admin)
+    NSX-T username (default: admin)
 
 .PARAMETER Password
-    NSX-T Manager password. If omitted, you will be prompted securely.
+    Password. If omitted you are prompted securely at runtime.
 
 .PARAMETER OutputPath
-    Directory where output files will be saved (default: current directory)
+    Folder for output files (default: current directory)
 
 .PARAMETER OutputFormat
-    Output format: "Excel", "CSV", or "Both" (default: "Excel")
+    "Excel" | "CSV" | "Both"  (default: Excel)
+    Excel requires the ImportExcel module — the script tries to install it automatically.
 
 .PARAMETER SkipCertificateCheck
-    Ignore TLS certificate errors (useful for self-signed certs in lab environments)
+    Bypass TLS certificate validation (self-signed certs in lab/dev environments)
 
 .EXAMPLE
-    .\Export-NSXFirewallRules.ps1 -NSXManager "192.168.1.10" -Username admin -SkipCertificateCheck
+    .\Export-NSXFirewallRules.ps1 -NSXManager 192.168.1.10 -SkipCertificateCheck
 
 .EXAMPLE
-    .\Export-NSXFirewallRules.ps1 -NSXManager nsxmgr.lab.local -OutputFormat Both -OutputPath C:\Exports
+    .\Export-NSXFirewallRules.ps1 -NSXManager nsxmgr.corp.local -OutputFormat Both -OutputPath C:\Exports
 
 .NOTES
-    Requires PowerShell 7+ (for -SkipCertificateCheck on Invoke-RestMethod).
-    For Excel output: Install-Module -Name ImportExcel
-    NSX-T API: Policy API v1 (compatible with NSX-T 3.x and 4.x)
+    PowerShell 5.1+ supported; 7+ recommended.
+    NSX-T 3.x / 4.x  (tested on 4.2.x)
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$NSXManager,
-
-    [Parameter(Mandatory = $false)]
-    [string]$Username = "admin",
-
-    [Parameter(Mandatory = $false)]
-    [string]$Password,
-
-    [Parameter(Mandatory = $false)]
-    [string]$OutputPath = (Get-Location).Path,
-
-    [Parameter(Mandatory = $false)]
-    [ValidateSet("Excel", "CSV", "Both")]
-    [string]$OutputFormat = "Excel",
-
-    [Parameter(Mandatory = $false)]
-    [switch]$SkipCertificateCheck
+    [Parameter(Mandatory=$true)]  [string]$NSXManager,
+    [Parameter(Mandatory=$false)] [string]$Username = "admin",
+    [Parameter(Mandatory=$false)] [string]$Password,
+    [Parameter(Mandatory=$false)] [string]$OutputPath = (Get-Location).Path,
+    [Parameter(Mandatory=$false)] [ValidateSet("Excel","CSV","Both")] [string]$OutputFormat = "Excel",
+    [Parameter(Mandatory=$false)] [switch]$SkipCertificateCheck
 )
 
-Set-StrictMode -Version Latest
+# ---------------------------------------------------------------------------
+# Strict mode OFF — avoids "property not found" on null PSCustomObject members
+# from ConvertFrom-Json. We do our own null-safety instead.
+# ---------------------------------------------------------------------------
+Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── TLS bypass (PS 5.1) ────────────────────────────────────────────────────
+if ($SkipCertificateCheck -and $PSVersionTable.PSVersion.Major -lt 7) {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint s, X509Certificate c,
+        WebRequest r, int p) { return true; }
+}
+"@
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    [System.Net.ServicePointManager]::SecurityProtocol  =
+        [System.Net.SecurityProtocolType]::Tls12 -bor
+        [System.Net.SecurityProtocolType]::Tls11
+}
+
+# ===========================================================================
+# UTILITY
+# ===========================================================================
 
 function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    param([string]$Msg, [string]$Level = "INFO")
     $color = switch ($Level) {
-        "WARN"    { "Yellow" }
-        "ERROR"   { "Red" }
-        "SUCCESS" { "Green" }
-        default   { "Cyan" }
+        "WARN"    {"Yellow"} "ERROR" {"Red"} "SUCCESS" {"Green"} default {"Cyan"}
     }
-    Write-Host "[$ts][$Level] $Message" -ForegroundColor $color
+    Write-Host "[$(Get-Date -f 'yyyy-MM-dd HH:mm:ss')][$Level] $Msg" -ForegroundColor $color
 }
 
-function Get-BasicAuthHeader {
-    param([string]$User, [string]$Pass)
-    $pair = "${User}:${Pass}"
-    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
-    $b64 = [Convert]::ToBase64String($bytes)
-    return @{ Authorization = "Basic $b64"; "Content-Type" = "application/json" }
+# Safe array wrap: always returns a real [array], never $null
+# This is the core fix — every property from ConvertFrom-Json that might be
+# $null, a single object, or an array gets run through this.
+function Coerce-Array {
+    param($Value)
+    if ($null -eq $Value)      { return @() }
+    if ($Value -is [array])    { return $Value }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        return @($Value)
+    }
+    return @($Value)   # single object → one-element array
 }
 
-function Invoke-NSXApi {
-    <#
-    .SYNOPSIS Wrapper around Invoke-RestMethod with pagination support.
-    Returns all results by following the cursor automatically.
-    #>
+# ===========================================================================
+# AUTHENTICATION  (session cookie + XSRF token)
+# ===========================================================================
+
+function Connect-NSX {
+    param([string]$Base, [string]$User, [string]$Pass, [bool]$SkipCert)
+
+    Write-Log "Authenticating to $Base as '$User' ..."
+
+    $sp = @{
+        Uri             = "$Base/api/session/create"
+        Method          = "POST"
+        Body            = "j_username=$([uri]::EscapeDataString($User))&j_password=$([uri]::EscapeDataString($Pass))"
+        ContentType     = "application/x-www-form-urlencoded"
+        SessionVariable = "ws"
+        UseBasicParsing = $true
+    }
+    if ($SkipCert -and $PSVersionTable.PSVersion.Major -ge 7) { $sp.SkipCertificateCheck = $true }
+
+    try   { $r = Invoke-WebRequest @sp }
+    catch {
+        $c = try { $_.Exception.Response.StatusCode.value__ } catch { "?" }
+        Write-Log "Login failed (HTTP $c): $($_.Exception.Message)" "ERROR"; throw
+    }
+
+    $xsrf = $r.Headers["x-xsrf-token"]
+    if ($xsrf -is [array]) { $xsrf = $xsrf[0] }
+    if (-not $xsrf) { Write-Log "x-xsrf-token missing — calls may fail." "WARN"; $xsrf = "" }
+
+    Write-Log "Session established." "SUCCESS"
+    return @{ WS = $ws; XSRF = $xsrf; Base = $Base }
+}
+
+function Disconnect-NSX {
+    param([hashtable]$S, [bool]$SkipCert)
+    try {
+        $sp = @{ Uri="$($S.Base)/api/session/destroy"; Method="POST"
+                 WebSession=$S.WS; Headers=@{"x-xsrf-token"=$S.XSRF}; UseBasicParsing=$true }
+        if ($SkipCert -and $PSVersionTable.PSVersion.Major -ge 7) { $sp.SkipCertificateCheck = $true }
+        Invoke-WebRequest @sp | Out-Null
+        Write-Log "Session closed."
+    } catch { Write-Log "Could not close session: $($_.Exception.Message)" "WARN" }
+}
+
+# ===========================================================================
+# API CALL WRAPPER  — GET with automatic cursor pagination
+# ===========================================================================
+
+function Invoke-NSX {
     param(
-        [string]$Endpoint,
-        [hashtable]$Headers,
-        [string]$BaseUrl,
-        [switch]$SkipCert,
-        [int]$PageSize = 1000
+        [string]$EP,
+        [hashtable]$S,
+        [bool]$SkipCert,
+        [int]$PgSz = 1000,
+        [switch]$NoPagination   # use for endpoints that reject ?page_size (e.g. gateway-firewall)
     )
 
-    $allResults = [System.Collections.Generic.List[object]]::new()
-    $url = "${BaseUrl}${Endpoint}?page_size=${PageSize}"
+    $all = [System.Collections.Generic.List[object]]::new()
+
+    # Some endpoints (gateway-firewall) return 400 if any query string is appended.
+    # For those, call the URL bare and do a single request only.
+    $url    = if ($NoPagination) { "$($S.Base)$EP" } else { "$($S.Base)$EP`?page_size=$PgSz" }
+    $cursor = $null
 
     do {
-        try {
-            $splat = @{
-                Uri     = $url
-                Method  = "GET"
-                Headers = $Headers
-            }
-            if ($SkipCert) { $splat["SkipCertificateCheck"] = $true }
+        $sp = @{ Uri=$url; Method="GET"; WebSession=$S.WS
+                 Headers=@{"x-xsrf-token"=$S.XSRF}; UseBasicParsing=$true }
+        if ($SkipCert -and $PSVersionTable.PSVersion.Major -ge 7) { $sp.SkipCertificateCheck = $true }
 
-            $response = Invoke-RestMethod @splat
-
-            # Collect results — different endpoints use different property names
-            $items = if ($response.PSObject.Properties.Name -contains "results") {
-                $response.results
-            } elseif ($response.PSObject.Properties.Name -contains "rules") {
-                $response.rules
-            } else {
-                # Single object or gateway-firewall flat list
-                if ($response -is [array]) { $response } else { @($response) }
-            }
-
-            if ($items) { $allResults.AddRange([object[]]$items) }
-
-            # Follow cursor for pagination
-            if ($response.PSObject.Properties.Name -contains "cursor" -and $response.cursor) {
-                $cursor = $response.cursor
-                $url = "${BaseUrl}${Endpoint}?page_size=${PageSize}&cursor=${cursor}"
-            } else {
-                $cursor = $null
-            }
-        }
+        try   { $resp = (Invoke-WebRequest @sp).Content | ConvertFrom-Json }
         catch {
-            $status = $_.Exception.Response.StatusCode.value__
-            if ($status -eq 404) {
-                Write-Log "404 Not Found: $url — skipping." "WARN"
-                return @()
-            }
-            throw
+            $c = try { $_.Exception.Response.StatusCode.value__ } catch { 0 }
+            if ($c -eq 404) { Write-Log "404 skipped: $url" "WARN"; return ,@() }
+            Write-Log "API error [$url]: $($_.Exception.Message)" "ERROR"; throw
         }
+
+        # Collect items — endpoint-dependent property name
+        $items = if     ($null -ne $resp.results) { Coerce-Array $resp.results }
+                 elseif ($null -ne $resp.rules)    { Coerce-Array $resp.rules }
+                 elseif ($resp -is [array])         { $resp }
+                 else                               { @($resp) }
+
+        foreach ($i in $items) { if ($null -ne $i) { $all.Add($i) } }
+
+        # Only follow cursor if pagination is enabled for this endpoint
+        $cursor = $null
+        if (-not $NoPagination -and $null -ne $resp.cursor -and $resp.cursor -ne "") {
+            $cursor = $resp.cursor
+            $url = "$($S.Base)$EP`?page_size=$PgSz&cursor=$cursor"
+        }
+
     } while ($cursor)
 
-    return $allResults.ToArray()
+    return ,$all.ToArray()
 }
 
-function Resolve-NSXPath {
-    <#
-    .SYNOPSIS Converts an NSX policy path like /infra/services/HTTPS to a friendly display name.
-    Uses a simple cache to avoid redundant API calls.
-    #>
+# ===========================================================================
+# PATH → DISPLAY NAME  (cached)
+# ===========================================================================
+
+function Resolve-Paths {
+    param($Paths, [hashtable]$S, [hashtable]$Cache, [bool]$SkipCert)
+
+    $arr = Coerce-Array $Paths
+    if ($arr.Count -eq 0) { return "ANY" }
+
+    $names = foreach ($p in $arr) {
+        if ([string]::IsNullOrWhiteSpace($p) -or $p -eq "ANY") { "ANY"; continue }
+
+        if ($Cache.ContainsKey($p)) { $Cache[$p]; continue }
+
+        $name = try {
+            $sp = @{ Uri="$($S.Base)/policy/api/v1$p"; Method="GET"
+                     WebSession=$S.WS; Headers=@{"x-xsrf-token"=$S.XSRF}; UseBasicParsing=$true }
+            if ($SkipCert -and $PSVersionTable.PSVersion.Major -ge 7) { $sp.SkipCertificateCheck = $true }
+            $obj = (Invoke-WebRequest @sp).Content | ConvertFrom-Json
+            if ($null -ne $obj -and $obj.display_name) { $obj.display_name }
+            else { ($p -split "/")[-1] }
+        } catch { ($p -split "/")[-1] }
+
+        $Cache[$p] = $name
+        $name
+    }
+
+    return (($names | Where-Object { $_ }) -join ", ")
+}
+
+function Format-Svc {
+    param($Entries)
+    $arr = Coerce-Array $Entries
+    if ($arr.Count -eq 0) { return "ANY" }
+
+    ($arr | ForEach-Object {
+        $rt = if ($_.resource_type) { $_.resource_type } else { "" }
+        switch ($rt) {
+            "L4PortSetServiceEntry"  {
+                $ports = if ($null -ne $_.destination_ports) {
+                    (Coerce-Array $_.destination_ports) -join ","
+                } else { "Any" }
+                "$($_.l4_protocol):$ports"
+            }
+            "ICMPTypeServiceEntry"   { "ICMP(type=$($_.icmp_type))" }
+            "IPProtocolServiceEntry" { "IP(proto=$($_.protocol_number))" }
+            default { if ($rt) { $rt } else { "Unknown" } }
+        }
+    }) -join " | "
+}
+
+# ===========================================================================
+# RULE  →  FLAT ROW
+# ===========================================================================
+
+function Flatten-Rule {
     param(
-        [string[]]$Paths,
-        [hashtable]$Headers,
-        [string]$BaseUrl,
-        [hashtable]$Cache,
-        [switch]$SkipCert
+        $Rule,
+        [string]$PolName, [string]$PolCat, [string]$PolID,
+        [string]$FWType,  [string]$GwName, [string]$GwType,
+        [hashtable]$S, [hashtable]$Cache, [bool]$SkipCert
     )
 
-    if (-not $Paths -or $Paths.Count -eq 0) { return "ANY" }
+    $ra = @{ S=$S; Cache=$Cache; SkipCert=$SkipCert }
 
-    $resolved = foreach ($p in $Paths) {
-        if ($p -eq "ANY" -or $p -eq "") { "ANY"; continue }
+    $src = Resolve-Paths -Paths $Rule.source_groups      @ra
+    $dst = Resolve-Paths -Paths $Rule.destination_groups @ra
 
-        if ($Cache.ContainsKey($p)) {
-            $Cache[$p]; continue
-        }
+    $svcArr = Coerce-Array $Rule.services
+    $svc = if ($svcArr.Count -gt 0 -and $svcArr[0] -ne "ANY") {
+               ($svcArr | ForEach-Object {
+                   if ($_ -eq "ANY") { "ANY" } else { Resolve-Paths -Paths @($_) @ra }
+               }) -join ", "
+           } elseif ((Coerce-Array $Rule.service_entries).Count -gt 0) {
+               Format-Svc -Entries $Rule.service_entries
+           } else { "ANY" }
 
-        try {
-            $apiPath = "/policy/api/v1" + $p
-            $splat = @{ Uri = "${BaseUrl}${apiPath}"; Method = "GET"; Headers = $Headers }
-            if ($SkipCert) { $splat["SkipCertificateCheck"] = $true }
-            $obj = Invoke-RestMethod @splat
-            $name = if ($obj.display_name) { $obj.display_name } else { $p }
-            $Cache[$p] = $name
-            $name
-        }
-        catch {
-            # Can't resolve – return the raw path's last segment as fallback
-            $fallback = ($p -split "/")[-1]
-            $Cache[$p] = $fallback
-            $fallback
-        }
-    }
+    $scopeArr = Coerce-Array $Rule.scope
+    $applied = if ($scopeArr.Count -gt 0 -and $scopeArr[0] -ne "ANY") {
+                   Resolve-Paths -Paths $scopeArr @ra
+               } elseif ($FWType -eq "DFW") { "DFW (All)" }
+               else { $GwName }
 
-    return ($resolved -join ", ")
-}
-
-function Format-Services {
-    param([array]$ServiceEntries)
-    if (-not $ServiceEntries -or $ServiceEntries.Count -eq 0) { return "ANY" }
-
-    $parts = foreach ($svc in $ServiceEntries) {
-        switch ($svc.resource_type) {
-            "L4PortSetServiceEntry" {
-                $proto = $svc.l4_protocol
-                $dstPorts = if ($svc.destination_ports) { $svc.destination_ports -join "," } else { "Any" }
-                "${proto}:${dstPorts}"
-            }
-            "ICMPTypeServiceEntry" {
-                "ICMP(type=$($svc.icmp_type))"
-            }
-            "IPProtocolServiceEntry" {
-                "IP:$($svc.protocol_number)"
-            }
-            default {
-                $svc.resource_type
-            }
-        }
-    }
-    return ($parts -join " | ")
-}
-
-function ConvertTo-FlatRule {
-    <#
-    .SYNOPSIS Converts a raw NSX rule object into a flat hashtable suitable for CSV/Excel export.
-    #>
-    param(
-        [object]$Rule,
-        [string]$PolicyName,
-        [string]$PolicyCategory,
-        [string]$PolicyID,
-        [string]$FirewallType,          # "DFW" or "GFW"
-        [string]$GatewayName,           # Only for GFW
-        [string]$GatewayType,           # "Tier-0" / "Tier-1"
-        [hashtable]$Headers,
-        [string]$BaseUrl,
-        [hashtable]$PathCache,
-        [switch]$SkipCert
-    )
-
-    $commonSplat = @{
-        Headers  = $Headers
-        BaseUrl  = $BaseUrl
-        Cache    = $PathCache
-        SkipCert = $SkipCert
-    }
-
-    $sources      = Resolve-NSXPath -Paths $Rule.source_groups      @commonSplat
-    $destinations = Resolve-NSXPath -Paths $Rule.destination_groups  @commonSplat
-
-    # Services: either path references or inline service entries
-    $serviceStr = if ($Rule.services -and $Rule.services.Count -gt 0 -and $Rule.services[0] -ne "ANY") {
-        $svcNames = foreach ($svcPath in $Rule.services) {
-            if ($svcPath -eq "ANY") { "ANY" }
-            else {
-                if ($PathCache.ContainsKey($svcPath)) { $PathCache[$svcPath] }
-                else {
-                    try {
-                        $splat = @{ Uri = "${BaseUrl}/policy/api/v1${svcPath}"; Method = "GET"; Headers = $Headers }
-                        if ($SkipCert) { $splat["SkipCertificateCheck"] = $true }
-                        $svcObj = Invoke-RestMethod @splat
-                        $name = $svcObj.display_name
-                        $PathCache[$svcPath] = $name
-                        $name
-                    } catch { ($svcPath -split "/")[-1] }
-                }
-            }
-        }
-        $svcNames -join ", "
-    } elseif ($Rule.service_entries -and $Rule.service_entries.Count -gt 0) {
-        Format-Services -ServiceEntries $Rule.service_entries
-    } else {
-        "ANY"
-    }
-
-    $appliedTo = if ($Rule.scope -and $Rule.scope.Count -gt 0 -and $Rule.scope[0] -ne "ANY") {
-        Resolve-NSXPath -Paths $Rule.scope @commonSplat
-    } else { "DFW" }
-
-    [ordered]@{
-        "Firewall Type"      = $FirewallType
-        "Gateway"            = if ($GatewayName) { $GatewayName } else { "N/A" }
-        "Gateway Type"       = if ($GatewayType) { $GatewayType } else { "N/A" }
-        "Policy Name"        = $PolicyName
-        "Policy ID"          = $PolicyID
-        "Category"           = $PolicyCategory
-        "Rule Name"          = $Rule.display_name
-        "Rule ID"            = $Rule.id
-        "Sequence Number"    = $Rule.sequence_number
-        "Source"             = $sources
-        "Destination"        = $destinations
-        "Services"           = $serviceStr
-        "Action"             = $Rule.action
-        "Direction"          = if ($Rule.direction) { $Rule.direction } else { "IN_OUT" }
-        "IP Protocol"        = if ($Rule.ip_protocol) { $Rule.ip_protocol } else { "IPV4_IPV6" }
-        "Applied To"         = $appliedTo
-        "Logged"             = if ($Rule.logged) { "Yes" } else { "No" }
-        "Disabled"           = if ($Rule.disabled) { "Yes" } else { "No" }
-        "Notes"              = if ($Rule.notes) { $Rule.notes } else { "" }
-        "Tags"               = if ($Rule.tags) { ($Rule.tags | ForEach-Object { "$($_.scope):$($_.tag)" }) -join ", " } else { "" }
+    [PSCustomObject][ordered]@{
+        "Firewall Type"   = $FWType
+        "Gateway"         = if ($GwName) { $GwName } else { "N/A" }
+        "Gateway Type"    = if ($GwType) { $GwType } else { "N/A" }
+        "Policy Name"     = $PolName
+        "Policy ID"       = $PolID
+        "Category"        = $PolCat
+        "Rule Name"       = if ($Rule.display_name)   { $Rule.display_name }   else { "" }
+        "Rule ID"         = if ($Rule.id)              { $Rule.id }             else { "" }
+        "Sequence Number" = if ($null -ne $Rule.sequence_number) { $Rule.sequence_number } else { "" }
+        "Source"          = $src
+        "Destination"     = $dst
+        "Services"        = $svc
+        "Action"          = if ($Rule.action)          { $Rule.action }         else { "" }
+        "Direction"       = if ($Rule.direction)       { $Rule.direction }      else { "IN_OUT" }
+        "IP Protocol"     = if ($Rule.ip_protocol)     { $Rule.ip_protocol }    else { "IPV4_IPV6" }
+        "Applied To"      = $applied
+        "Logged"          = if ($Rule.logged)           { "Yes" }               else { "No" }
+        "Disabled"        = if ($Rule.disabled)         { "Yes" }               else { "No" }
+        "Notes"           = if ($Rule.notes)            { $Rule.notes }         else { "" }
+        "Tags"            = if ($null -ne $Rule.tags) {
+                                (Coerce-Array $Rule.tags |
+                                 ForEach-Object { "$($_.scope):$($_.tag)" }) -join ", "
+                            } else { "" }
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
-# ── Password prompt ──────────────────────────────────────────────────────────
+# Password
 if (-not $Password) {
-    $secPass = Read-Host "Enter password for $Username@$NSXManager" -AsSecureString
+    $ss       = Read-Host "Password for $Username@$NSXManager" -AsSecureString
     $Password = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass)
-    )
+                    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss))
 }
 
-$baseUrl = "https://${NSXManager}"
-$headers = Get-BasicAuthHeader -User $Username -Pass $Password
-$skipCert = $SkipCertificateCheck.IsPresent
+$base     = "https://$NSXManager"
+$skipCert = [bool]$SkipCertificateCheck
 
-# ── Check ImportExcel if needed ──────────────────────────────────────────────
-if ($OutputFormat -in @("Excel", "Both")) {
+# ImportExcel check
+if ($OutputFormat -in @("Excel","Both")) {
     if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-        Write-Log "ImportExcel module not found. Attempting install..." "WARN"
-        try {
-            Install-Module -Name ImportExcel -Scope CurrentUser -Force -SkipPublisherCheck
-            Import-Module ImportExcel
-        } catch {
-            Write-Log "Could not install ImportExcel. Falling back to CSV only." "WARN"
-            $OutputFormat = "CSV"
-        }
-    } else {
-        Import-Module ImportExcel -ErrorAction SilentlyContinue
-    }
+        Write-Log "ImportExcel not found — trying to install..." "WARN"
+        try   { Install-Module ImportExcel -Scope CurrentUser -Force -SkipPublisherCheck
+                Import-Module ImportExcel }
+        catch { Write-Log "ImportExcel install failed — switching to CSV." "WARN"
+                $OutputFormat = "CSV" }
+    } else { Import-Module ImportExcel -ErrorAction SilentlyContinue }
 }
 
-# Shared path resolution cache (avoids redundant API calls)
-$pathCache = @{}
+# Connect
+$S = Connect-NSX -Base $base -User $Username -Pass $Password -SkipCert $skipCert
 
-$allDFWRows  = [System.Collections.Generic.List[object]]::new()
-$allGFWRows  = [System.Collections.Generic.List[object]]::new()
+$cache   = @{}
+$dfwRows = [System.Collections.Generic.List[object]]::new()
+$gfwRows = [System.Collections.Generic.List[object]]::new()
 
-# ── 1. DISTRIBUTED FIREWALL ─────────────────────────────────────────────────
-Write-Log "=== Fetching Distributed Firewall Rules ==="
+try {
 
-$dfwPolicies = Invoke-NSXApi `
-    -Endpoint "/policy/api/v1/infra/domains/default/security-policies" `
-    -Headers $headers -BaseUrl $baseUrl -SkipCert:$skipCert
+    # ── DFW ─────────────────────────────────────────────────────────────────
+    Write-Log "=== Distributed Firewall ==="
+    $policies = Invoke-NSX -EP "/policy/api/v1/infra/domains/default/security-policies" -S $S -SkipCert $skipCert
+    Write-Log "Found $(($policies).Count) DFW security policies."
 
-Write-Log "Found $($dfwPolicies.Count) DFW security policies."
+    foreach ($pol in $policies) {
+        $cat = if ($pol.category) { $pol.category } else { "Application" }
+        Write-Log "  Policy: '$($pol.display_name)' [$cat]"
 
-foreach ($policy in $dfwPolicies) {
-    $policyName = $policy.display_name
-    $policyID   = $policy.id
-    $category   = if ($policy.category) { $policy.category } else { "Application" }
+        $rules = Invoke-NSX -EP "/policy/api/v1/infra/domains/default/security-policies/$($pol.id)/rules" -S $S -SkipCert $skipCert
+        Write-Log "    -> $(($rules).Count) rules"
 
-    Write-Log "  Processing DFW policy: '$policyName' (Category: $category)"
-
-    $rules = Invoke-NSXApi `
-        -Endpoint "/policy/api/v1/infra/domains/default/security-policies/${policyID}/rules" `
-        -Headers $headers -BaseUrl $baseUrl -SkipCert:$skipCert
-
-    Write-Log "    → $($rules.Count) rules found."
-
-    foreach ($rule in $rules) {
-        $row = ConvertTo-FlatRule `
-            -Rule $rule `
-            -PolicyName $policyName `
-            -PolicyCategory $category `
-            -PolicyID $policyID `
-            -FirewallType "DFW" `
-            -GatewayName "" `
-            -GatewayType "" `
-            -Headers $headers `
-            -BaseUrl $baseUrl `
-            -PathCache $pathCache `
-            -SkipCert:$skipCert
-        $allDFWRows.Add([PSCustomObject]$row)
-    }
-}
-
-# ── 2. GATEWAY FIREWALL — Tier-0 ────────────────────────────────────────────
-Write-Log "=== Fetching Gateway Firewall Rules (Tier-0) ==="
-
-$tier0s = Invoke-NSXApi `
-    -Endpoint "/policy/api/v1/infra/tier-0s" `
-    -Headers $headers -BaseUrl $baseUrl -SkipCert:$skipCert
-
-Write-Log "Found $($tier0s.Count) Tier-0 gateways."
-
-foreach ($t0 in $tier0s) {
-    $gwName = $t0.display_name
-    $gwID   = $t0.id
-    Write-Log "  Processing Tier-0: '$gwName'"
-
-    # gateway-firewall returns a flat list of policy objects with embedded rules
-    $gwPolicies = Invoke-NSXApi `
-        -Endpoint "/policy/api/v1/infra/tier-0s/${gwID}/gateway-firewall" `
-        -Headers $headers -BaseUrl $baseUrl -SkipCert:$skipCert
-
-    foreach ($gfwPolicy in $gwPolicies) {
-        $policyName = $gfwPolicy.display_name
-        $policyID   = $gfwPolicy.id
-        $category   = if ($gfwPolicy.category) { $gfwPolicy.category } else { "Default" }
-        $rules      = if ($gfwPolicy.rules) { $gfwPolicy.rules } else { @() }
-
-        Write-Log "    Policy: '$policyName' — $($rules.Count) rules"
-
-        foreach ($rule in $rules) {
-            $row = ConvertTo-FlatRule `
-                -Rule $rule `
-                -PolicyName $policyName `
-                -PolicyCategory $category `
-                -PolicyID $policyID `
-                -FirewallType "GFW" `
-                -GatewayName $gwName `
-                -GatewayType "Tier-0" `
-                -Headers $headers `
-                -BaseUrl $baseUrl `
-                -PathCache $pathCache `
-                -SkipCert:$skipCert
-            $allGFWRows.Add([PSCustomObject]$row)
+        foreach ($r in $rules) {
+            $dfwRows.Add((Flatten-Rule -Rule $r -PolName $pol.display_name -PolCat $cat -PolID $pol.id `
+                -FWType "DFW" -GwName "" -GwType "" -S $S -Cache $cache -SkipCert $skipCert))
         }
     }
-}
 
-# ── 3. GATEWAY FIREWALL — Tier-1 ────────────────────────────────────────────
-Write-Log "=== Fetching Gateway Firewall Rules (Tier-1) ==="
+    # ── GFW Tier-0 ──────────────────────────────────────────────────────────
+    Write-Log "=== Gateway Firewall — Tier-0 ==="
+    $t0s = Invoke-NSX -EP "/policy/api/v1/infra/tier-0s" -S $S -SkipCert $skipCert
+    Write-Log "Found $(($t0s).Count) Tier-0 gateways."
 
-$tier1s = Invoke-NSXApi `
-    -Endpoint "/policy/api/v1/infra/tier-1s" `
-    -Headers $headers -BaseUrl $baseUrl -SkipCert:$skipCert
-
-Write-Log "Found $($tier1s.Count) Tier-1 gateways."
-
-foreach ($t1 in $tier1s) {
-    $gwName = $t1.display_name
-    $gwID   = $t1.id
-    Write-Log "  Processing Tier-1: '$gwName'"
-
-    $gwPolicies = Invoke-NSXApi `
-        -Endpoint "/policy/api/v1/infra/tier-1s/${gwID}/gateway-firewall" `
-        -Headers $headers -BaseUrl $baseUrl -SkipCert:$skipCert
-
-    foreach ($gfwPolicy in $gwPolicies) {
-        $policyName = $gfwPolicy.display_name
-        $policyID   = $gfwPolicy.id
-        $category   = if ($gfwPolicy.category) { $gfwPolicy.category } else { "Default" }
-        $rules      = if ($gfwPolicy.rules) { $gfwPolicy.rules } else { @() }
-
-        Write-Log "    Policy: '$policyName' — $($rules.Count) rules"
-
-        foreach ($rule in $rules) {
-            $row = ConvertTo-FlatRule `
-                -Rule $rule `
-                -PolicyName $policyName `
-                -PolicyCategory $category `
-                -PolicyID $policyID `
-                -FirewallType "GFW" `
-                -GatewayName $gwName `
-                -GatewayType "Tier-1" `
-                -Headers $headers `
-                -BaseUrl $baseUrl `
-                -PathCache $pathCache `
-                -SkipCert:$skipCert
-            $allGFWRows.Add([PSCustomObject]$row)
+    foreach ($gw in $t0s) {
+        Write-Log "  Tier-0: '$($gw.display_name)'"
+        $pols = Invoke-NSX -EP "/policy/api/v1/infra/tier-0s/$($gw.id)/gateway-firewall" -S $S -SkipCert $skipCert -NoPagination
+        foreach ($pol in $pols) {
+            $cat   = if ($pol.category) { $pol.category } else { "Default" }
+            $rules = Coerce-Array $pol.rules
+            Write-Log "    Policy '$($pol.display_name)': $($rules.Count) rules"
+            foreach ($r in $rules) {
+                $gfwRows.Add((Flatten-Rule -Rule $r -PolName $pol.display_name -PolCat $cat -PolID $pol.id `
+                    -FWType "GFW" -GwName $gw.display_name -GwType "Tier-0" -S $S -Cache $cache -SkipCert $skipCert))
+            }
         }
     }
+
+    # ── GFW Tier-1 ──────────────────────────────────────────────────────────
+    Write-Log "=== Gateway Firewall — Tier-1 ==="
+    $t1s = Invoke-NSX -EP "/policy/api/v1/infra/tier-1s" -S $S -SkipCert $skipCert
+    Write-Log "Found $(($t1s).Count) Tier-1 gateways."
+
+    foreach ($gw in $t1s) {
+        Write-Log "  Tier-1: '$($gw.display_name)'"
+        $pols = Invoke-NSX -EP "/policy/api/v1/infra/tier-1s/$($gw.id)/gateway-firewall" -S $S -SkipCert $skipCert -NoPagination
+        foreach ($pol in $pols) {
+            $cat   = if ($pol.category) { $pol.category } else { "Default" }
+            $rules = Coerce-Array $pol.rules
+            Write-Log "    Policy '$($pol.display_name)': $($rules.Count) rules"
+            foreach ($r in $rules) {
+                $gfwRows.Add((Flatten-Rule -Rule $r -PolName $pol.display_name -PolCat $cat -PolID $pol.id `
+                    -FWType "GFW" -GwName $gw.display_name -GwType "Tier-1" -S $S -Cache $cache -SkipCert $skipCert))
+            }
+        }
+    }
+
+} finally {
+    Disconnect-NSX -S $S -SkipCert $skipCert
 }
 
 # Summary
-$totalDFW = $allDFWRows.Count
-$totalGFW = $allGFWRows.Count
-Write-Log "=== Collection complete: $totalDFW DFW rules, $totalGFW GFW rules ===" "SUCCESS"
+$nDFW = $dfwRows.Count
+$nGFW = $gfwRows.Count
+Write-Log "=== Done: $nDFW DFW rules | $nGFW GFW rules ===" "SUCCESS"
+if ($nDFW -eq 0 -and $nGFW -eq 0) { Write-Log "No rules found." "WARN"; exit 0 }
 
-if ($totalDFW -eq 0 -and $totalGFW -eq 0) {
-    Write-Log "No rules found. Exiting." "WARN"
-    exit 0
-}
+# Output path
+if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath | Out-Null }
+$ts      = Get-Date -Format "yyyyMMdd_HHmmss"
+$safeMgr = $NSXManager -replace "[^a-zA-Z0-9_\-]","_"
+$base2   = Join-Path $OutputPath "NSX_FW_Export_${safeMgr}_${ts}"
 
-# ── 4. OUTPUT ────────────────────────────────────────────────────────────────
-$timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$safeMgr    = $NSXManager -replace "[^a-zA-Z0-9_\-]", "_"
-$baseName   = "NSX_FW_Export_${safeMgr}_${timestamp}"
+# ── Excel ────────────────────────────────────────────────────────────────────
+if ($OutputFormat -in @("Excel","Both")) {
+    $xlsx = "$base2.xlsx"
+    $xs   = @{ AutoSize=$true; BoldTopRow=$true; FreezeTopRow=$true; AutoFilter=$true }
 
-if (-not (Test-Path $OutputPath)) {
-    New-Item -ItemType Directory -Path $OutputPath | Out-Null
-}
-
-# ── Excel output ─────────────────────────────────────────────────────────────
-if ($OutputFormat -in @("Excel", "Both")) {
-    $xlsxPath = Join-Path $OutputPath "${baseName}.xlsx"
-    Write-Log "Writing Excel file: $xlsxPath"
-
-    # Summary sheet data
-    $summaryRows = @(
-        [PSCustomObject]@{ Item = "NSX Manager";           Value = $NSXManager }
-        [PSCustomObject]@{ Item = "Export Date";           Value = (Get-Date -Format "yyyy-MM-dd HH:mm:ss") }
-        [PSCustomObject]@{ Item = "DFW Rules Exported";    Value = $totalDFW }
-        [PSCustomObject]@{ Item = "GFW Rules Exported";    Value = $totalGFW }
-        [PSCustomObject]@{ Item = "Total Rules Exported";  Value = ($totalDFW + $totalGFW) }
-    )
-
-    # Common Excel styling parameters
-    $xlStyle = @{
-        AutoSize       = $true
-        BoldTopRow     = $true
-        FreezeTopRow   = $true
-        AutoFilter     = $true
-    }
-
-    # Write Summary
-    $summaryRows | Export-Excel -Path $xlsxPath -WorksheetName "Summary" `
+    @(
+        [PSCustomObject]@{ Item="NSX Manager";   Value=$NSXManager }
+        [PSCustomObject]@{ Item="Export Date";   Value=(Get-Date -f "yyyy-MM-dd HH:mm:ss") }
+        [PSCustomObject]@{ Item="DFW Rules";     Value=$nDFW }
+        [PSCustomObject]@{ Item="GFW Rules";     Value=$nGFW }
+        [PSCustomObject]@{ Item="Total Rules";   Value=($nDFW+$nGFW) }
+    ) | Export-Excel -Path $xlsx -WorksheetName "Summary" `
         -AutoSize -BoldTopRow -FreezeTopRow -TableName "Summary" -TableStyle Medium9
 
-    # Write DFW rules
-    if ($allDFWRows.Count -gt 0) {
-        $allDFWRows | Export-Excel -Path $xlsxPath -WorksheetName "Distributed Firewall" `
-            @xlStyle -TableName "DFWRules" -TableStyle Medium2 -Append:$false
+    if ($nDFW -gt 0) {
+        $dfwRows | Export-Excel -Path $xlsx -WorksheetName "Distributed Firewall" `
+            @xs -TableName "DFWRules" -TableStyle Medium2
+    }
+    if ($nGFW -gt 0) {
+        $gfwRows | Export-Excel -Path $xlsx -WorksheetName "Gateway Firewall" `
+            @xs -TableName "GFWRules" -TableStyle Medium4
     }
 
-    # Write GFW rules
-    if ($allGFWRows.Count -gt 0) {
-        $allGFWRows | Export-Excel -Path $xlsxPath -WorksheetName "Gateway Firewall" `
-            @xlStyle -TableName "GFWRules" -TableStyle Medium4 -Append:$false
-    }
+    $combined = @($dfwRows.ToArray()) + @($gfwRows.ToArray())
+    $combined | Export-Excel -Path $xlsx -WorksheetName "All Rules" `
+        @xs -TableName "AllRules" -TableStyle Medium6
 
-    # Combined sheet (all rules)
-    $allRows = [System.Collections.Generic.List[object]]::new()
-    $allRows.AddRange($allDFWRows.ToArray())
-    $allRows.AddRange($allGFWRows.ToArray())
-
-    $allRows | Export-Excel -Path $xlsxPath -WorksheetName "All Rules" `
-        @xlStyle -TableName "AllRules" -TableStyle Medium6 -Append:$false
-
-    Write-Log "Excel export complete: $xlsxPath" "SUCCESS"
+    Write-Log "Excel: $xlsx" "SUCCESS"
 }
 
-# ── CSV output ───────────────────────────────────────────────────────────────
-if ($OutputFormat -in @("CSV", "Both")) {
-    if ($allDFWRows.Count -gt 0) {
-        $dfwCsv = Join-Path $OutputPath "${baseName}_DFW.csv"
-        $allDFWRows | Export-Csv -Path $dfwCsv -NoTypeInformation -Encoding UTF8
-        Write-Log "DFW CSV: $dfwCsv" "SUCCESS"
+# ── CSV ───────────────────────────────────────────────────────────────────────
+if ($OutputFormat -in @("CSV","Both")) {
+    if ($nDFW -gt 0) {
+        $dfwRows | Export-Csv "$base2`_DFW.csv" -NoTypeInformation -Encoding UTF8
+        Write-Log "DFW CSV: $base2`_DFW.csv" "SUCCESS"
     }
-
-    if ($allGFWRows.Count -gt 0) {
-        $gfwCsv = Join-Path $OutputPath "${baseName}_GFW.csv"
-        $allGFWRows | Export-Csv -Path $gfwCsv -NoTypeInformation -Encoding UTF8
-        Write-Log "GFW CSV: $gfwCsv" "SUCCESS"
+    if ($nGFW -gt 0) {
+        $gfwRows | Export-Csv "$base2`_GFW.csv" -NoTypeInformation -Encoding UTF8
+        Write-Log "GFW CSV: $base2`_GFW.csv" "SUCCESS"
     }
-
-    # Combined
-    $allRows2 = @($allDFWRows) + @($allGFWRows)
-    $allCsv = Join-Path $OutputPath "${baseName}_ALL.csv"
-    $allRows2 | Export-Csv -Path $allCsv -NoTypeInformation -Encoding UTF8
-    Write-Log "Combined CSV: $allCsv" "SUCCESS"
+    $combined2 = @($dfwRows.ToArray()) + @($gfwRows.ToArray())
+    $combined2 | Export-Csv "$base2`_ALL.csv" -NoTypeInformation -Encoding UTF8
+    Write-Log "Combined CSV: $base2`_ALL.csv" "SUCCESS"
 }
 
-Write-Log "=== Export finished successfully ===" "SUCCESS"
+Write-Log "=== Export complete ===" "SUCCESS"
